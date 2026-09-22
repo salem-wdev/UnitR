@@ -8,39 +8,45 @@ using System.Threading.Tasks;
 using MediatR;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using UnitR.Abstractions.Adapters;
 using UnitR.Abstractions.Contracts;
 using UnitR.Abstractions.Services;
 using UnitR.Core.ErrorHandling;
 using UnitR.Core.Options;
 
 /// <summary>
-/// Implements the transactional unit of work orchestration, seamlessly combining
-/// auto-harvested domain events from <see cref="IDomainEventProvider"/> with explicitly provided notifications.
+/// Implements the transactional unit of work orchestration.
+/// Coordinates business workloads, automatic transaction boundaries via <see cref="ITransactionAdapter"/>,
+/// background event harvesting via <see cref="IDomainEventProvider"/>, and pre/post-commit event dispatching.
 /// </summary>
 public sealed class UnitOfWork : IUnitOfWork
 {
     private readonly IMediator _mediator;
     private readonly ILogger<UnitOfWork> _logger;
     private readonly UnitROptions _options;
+    private readonly ITransactionAdapter _transactionAdapter;
     private readonly IDomainEventProvider? _domainEventProvider;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="UnitOfWork"/> class.
     /// </summary>
     /// <param name="mediator">The MediatR mediator instance used for publishing notifications.</param>
-    /// <param name="logger">The logger instance for diagnostics and error tracking.</param>
-    /// <param name="options">The configuration options controlling post-commit behavior.</param>
-    /// <param name="domainEventProvider">Optional provider for auto-harvesting uncommitted domain events.</param>
-    /// <exception cref="ArgumentNullException">Thrown when mediator or logger is null.</exception>
+    /// <param name="logger">The logger instance for diagnostics and structured error tracking.</param>
+    /// <param name="options">The configuration options controlling post-commit execution behaviors.</param>
+    /// <param name="transactionAdapter">The persistence adapter managing the physical transaction lifecycle.</param>
+    /// <param name="domainEventProvider">Optional provider for auto-harvesting uncommitted domain events from entities.</param>
+    /// <exception cref="ArgumentNullException">Thrown when required dependencies are null.</exception>
     public UnitOfWork(
         IMediator mediator,
         ILogger<UnitOfWork> logger,
         IOptions<UnitROptions> options,
+        ITransactionAdapter transactionAdapter,
         IDomainEventProvider? domainEventProvider = null)
     {
         _mediator = mediator ?? throw new ArgumentNullException(nameof(mediator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _options = options?.Value ?? new UnitROptions();
+        _transactionAdapter = transactionAdapter ?? throw new ArgumentNullException(nameof(transactionAdapter));
         _domainEventProvider = domainEventProvider;
     }
 
@@ -68,36 +74,78 @@ public sealed class UnitOfWork : IUnitOfWork
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        // 1. Harvest both auto-collected events from the provider and explicitly passed notifications
-        var autoEvents = _domainEventProvider?.GetDomainEvents() ?? Array.Empty<INotification>();
-        var explicitList = explicitEvents ?? Array.Empty<INotification>();
+        TResult result;
+        var postCommitEvents = new List<IPostCommitNotification>();
 
-        var allEvents = autoEvents.Concat(explicitList).ToList();
+        // Check if this instance owns the outermost transaction boundary to support nested executions safely
+        bool isTransactionOwner = !_transactionAdapter.HasActiveTransaction;
 
-        // 2. Segregate notifications into pre-commit and post-commit pipelines
-        var preCommitEvents = allEvents.OfType<IPreCommitNotification>().ToList();
-        var postCommitEvents = allEvents.OfType<IPostCommitNotification>().ToList();
-
-        // 3. Dispatch pre-commit events sequentially within the transactional boundary
-        if (preCommitEvents.Count > 0)
+        try
         {
-            _logger.LogDebug("Publishing {Count} pre-commit domain event(s).", preCommitEvents.Count);
-
-            foreach (var preEvent in preCommitEvents)
+            // 1. Begin the underlying transaction boundary if no active transaction exists
+            if (isTransactionOwner)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                await _mediator.Publish(preEvent, cancellationToken).ConfigureAwait(false);
+                await _transactionAdapter.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("Initiated physical database transaction boundary.");
+            }
+
+            // 2. Execute the user's workload (mutates domain aggregates and registers state changes)
+            _logger.LogDebug("Executing transactional business workload.");
+            result = await action().ConfigureAwait(false);
+
+            // 3. Harvest events: Collect background entity events and merge with explicitly passed notifications
+            var backgroundEvents = _domainEventProvider?.GetDomainEvents() ?? Array.Empty<INotification>();
+            var explicitList = explicitEvents ?? Array.Empty<INotification>();
+
+            var allEvents = backgroundEvents.Concat(explicitList).ToList();
+
+            var preCommitEvents = allEvents.OfType<IPreCommitNotification>().ToList();
+            postCommitEvents.AddRange(allEvents.OfType<IPostCommitNotification>());
+
+            // 4. Dispatch pre-commit notifications sequentially within the active transaction
+            if (preCommitEvents.Count > 0)
+            {
+                _logger.LogDebug("Publishing {Count} pre-commit domain event(s).", preCommitEvents.Count);
+
+                foreach (var preEvent in preCommitEvents)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await _mediator.Publish(preEvent, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            // 5. Commit the physical transaction boundary
+            if (isTransactionOwner)
+            {
+                await _transactionAdapter.CommitAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("Committed physical database transaction boundary successfully.");
             }
         }
+        catch (Exception ex)
+        {
+            // 6. Rollback automatically on workload or pre-commit failures
+            _logger.LogError(ex, "An error occurred during transaction execution. Initiating automatic rollback.");
 
-        // 4. Execute the primary business workload (e.g., entity state changes and persistence commit)
-        _logger.LogDebug("Executing transactional workload.");
-        TResult result = await action().ConfigureAwait(false);
+            if (isTransactionOwner)
+            {
+                try
+                {
+                    await _transactionAdapter.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception rollbackEx)
+                {
+                    _logger.LogCritical(rollbackEx, "Critical error: Failed to rollback physical transaction.");
+                }
+            }
 
-        // 5. Purge harvested events from the provider to avoid duplicate execution in subsequent calls
+            // Rethrow original business exception to let upstream callers handle it
+            throw;
+        }
+
+        // 7. Clear auto-harvested domain events only after a successful commit
         _domainEventProvider?.ClearDomainEvents();
 
-        // 6. Dispatch post-commit events outside the transaction boundary using configured execution mode
+        // 8. Dispatch post-commit notifications outside the transaction boundary
         if (postCommitEvents.Count > 0)
         {
             _logger.LogDebug(
@@ -114,12 +162,6 @@ public sealed class UnitOfWork : IUnitOfWork
     /// <summary>
     /// Handles post-commit notifications sequentially or concurrently based on runtime configuration.
     /// </summary>
-    /// <param name="events">The collection of post-commit notifications to publish.</param>
-    /// <param name="cancellationToken">The cancellation token to monitor for cancellation requests.</param>
-    /// <returns>A task representing the asynchronous publication process.</returns>
-    /// <exception cref="PostCommitExecutionException">
-    /// Thrown when handler failures occur and <see cref="PostCommitErrorBehavior.LogAndThrow"/> is active.
-    /// </exception>
     private async Task PublishPostCommitEventsAsync(
         IReadOnlyList<IPostCommitNotification> events,
         CancellationToken cancellationToken)
@@ -128,7 +170,7 @@ public sealed class UnitOfWork : IUnitOfWork
 
         if (_options.PostCommitMode == PostCommitExecutionMode.Sequential)
         {
-            // Execute handlers serially one after another
+            // Execute handlers sequentially one after another
             foreach (var postEvent in events)
             {
                 try
@@ -149,7 +191,7 @@ public sealed class UnitOfWork : IUnitOfWork
         }
         else
         {
-            // Execute handlers concurrently using Task.WhenAll
+            // Execute handlers concurrently across thread pool tasks
             var tasks = events.Select(async postEvent =>
             {
                 try
