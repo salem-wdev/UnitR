@@ -1,0 +1,66 @@
+## Build results and compilation outputs
+[Dd]ebug/
+[Dd]ebugPublic/
+[Release/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio cache and user files
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.userprefs
+*.dbmdl
+*.jfm
+
+## Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+## JetBrains Rider / Resharper
+.idea/
+*.DotSettings.user
+_ReSharper*/
+
+## Test Results, Code Coverage, and Benchmarks
+TestResults/
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+BenchmarkDotNet.Artifacts/
+
+## NuGet and Dependencies
+*.nuget.props
+*.nuget.targets
+project.lock.json
+project.assets.json
+packages/
+*.nupkg
+*.snupkg
+
+## OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+## Temporary and backup files
+*.swp
+*~
+*.bak
+*.tmp
+*.log
