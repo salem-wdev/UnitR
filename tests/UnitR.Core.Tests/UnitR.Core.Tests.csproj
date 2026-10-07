@@ -19,8 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\src\UnitR.Abstractions\UnitR.Abstractions.csproj" />
-    <ProjectReference Include="..\src\UnitR.Core\UnitR.Core.csproj" />
+    <ProjectReference Include="..\..\src\UnitR.Abstractions\UnitR.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\UnitR.Core\UnitR.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>
