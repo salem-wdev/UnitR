@@ -182,7 +182,6 @@ public sealed class UnitOfWork : IUnitOfWork
 
             // Extract all accumulated post-commit notifications once pre-commit operations stabilize
             postCommitEvents.AddRange(_accumulatedExplicitEvents.OfType<IPostCommitNotification>());
-            _accumulatedExplicitEvents.Clear();
 
             // 2. Persist all changes to the underlying database within the transaction boundary
             await _transactionAdapter.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
