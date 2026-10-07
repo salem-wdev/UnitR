@@ -23,6 +23,14 @@ public interface ITransactionAdapter : IAsyncDisposable
     Task BeginTransactionAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Flushes all tracked modifications or pending in-memory state changes to the underlying database without closing the transaction.
+    /// Adapters without in-memory change trackers (e.g., ADO.NET) should complete immediately as a no-op.
+    /// </summary>
+    /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
+    /// <returns>A task representing the asynchronous flush operation.</returns>
+    Task SaveChangesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Persists state changes and commits the active physical transaction asynchronously.
     /// </summary>
     /// <param name="cancellationToken">A token to monitor for cancellation requests.</param>
