@@ -1,5 +1,6 @@
 ﻿namespace UnitR.Abstractions.Adapters;
 
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -7,7 +8,7 @@ using System.Threading.Tasks;
 /// Defines the persistence-agnostic abstraction for managing underlying database transaction lifecycles.
 /// Concrete adapters (such as EF Core or ADO.NET) implement this contract to execute physical transaction boundaries.
 /// </summary>
-public interface ITransactionAdapter
+public interface ITransactionAdapter : IAsyncDisposable
 {
     /// <summary>
     /// Gets a value indicating whether an active physical database transaction is currently running.
