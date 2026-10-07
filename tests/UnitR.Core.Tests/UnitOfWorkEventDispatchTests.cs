@@ -137,7 +137,7 @@ public class UnitOfWorkEventDispatchTests
     public async Task CommitAsync_WhenPostCommitEventThrows_InLogAndIgnoreMode_ShouldSwallowException()
     {
         // Arrange: Default behavior is to Log and Ignore
-        _options.PostCommitErrorBehavior = PostCommitErrorBehavior.LogAndIgnore;
+        _options.PostCommitErrorBehavior = PostCommitErrorBehavior.LogAndSuppress;
         var postEvent = new Mock<IPostCommitNotification>().Object;
 
         _mediatorMock.Setup(m => m.Publish(postEvent, It.IsAny<CancellationToken>()))
