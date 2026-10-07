@@ -15,9 +15,9 @@ using UnitR.Core.ErrorHandling;
 using UnitR.Core.Options;
 
 /// <summary>
-/// Implements the transactional unit of work orchestration.
-/// Coordinates business workloads, automatic transaction boundaries via <see cref="ITransactionAdapter"/>,
-/// background event harvesting via <see cref="IDomainEventProvider"/>, and pre/post-commit event dispatching.
+/// Implements the transactional unit of work orchestrator.
+/// Coordinates transaction boundaries, nested execution scopes, safe rollbacks,
+/// deferred batching of domain events, and pre/post-commit event dispatching.
 /// </summary>
 public sealed class UnitOfWork : IUnitOfWork
 {
@@ -25,127 +25,186 @@ public sealed class UnitOfWork : IUnitOfWork
     private readonly ILogger<UnitOfWork> _logger;
     private readonly UnitROptions _options;
     private readonly ITransactionAdapter _transactionAdapter;
-    private readonly IDomainEventProvider? _domainEventProvider;
+
+    /// <summary>
+    /// Tracks the current nesting depth of execution scopes to defer root commit operations.
+    /// </summary>
+    private int _nestingLevel;
+
+    /// <summary>
+    /// Accumulates domain events passed explicitly by callers across all nested operations.
+    /// </summary>
+    private readonly List<INotification> _accumulatedExplicitEvents = new();
+
+    private bool _isCommitted;
+    private bool _isRolledBack;
+    private bool _isDisposed;
+    private bool _isTransactionOwner;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="UnitOfWork"/> class.
     /// </summary>
-    /// <param name="mediator">The MediatR mediator instance used for publishing notifications.</param>
-    /// <param name="logger">The logger instance for diagnostics and structured error tracking.</param>
-    /// <param name="options">The configuration options controlling post-commit execution behaviors.</param>
-    /// <param name="transactionAdapter">The persistence adapter managing the physical transaction lifecycle.</param>
-    /// <param name="domainEventProvider">Optional provider for auto-harvesting uncommitted domain events from entities.</param>
-    /// <exception cref="ArgumentNullException">Thrown when required dependencies are null.</exception>
+    /// <param name="mediator">The MediatR publishing engine used for notification dispatching.</param>
+    /// <param name="logger">The structured diagnostics logger.</param>
+    /// <param name="options">Configuration options controlling post-commit behaviors.</param>
+    /// <param name="transactionAdapter">The persistence adapter managing physical transaction boundaries.</param>
+    /// <exception cref="ArgumentNullException">Thrown when any required dependency is null.</exception>
     public UnitOfWork(
         IMediator mediator,
         ILogger<UnitOfWork> logger,
         IOptions<UnitROptions> options,
-        ITransactionAdapter transactionAdapter,
-        IDomainEventProvider? domainEventProvider = null)
+        ITransactionAdapter transactionAdapter)
     {
         _mediator = mediator ?? throw new ArgumentNullException(nameof(mediator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _options = options?.Value ?? new UnitROptions();
         _transactionAdapter = transactionAdapter ?? throw new ArgumentNullException(nameof(transactionAdapter));
-        _domainEventProvider = domainEventProvider;
     }
 
     /// <inheritdoc />
-    public async Task ExecuteAsync(
-        Func<Task> action,
-        CancellationToken cancellationToken = default,
-        params INotification[] explicitEvents)
+    public async Task BeginAsync(CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(action);
+        ThrowIfDisposed();
 
-        // Delegate to the generic overload returning a discardable null value
-        await ExecuteAsync<object?>(async () =>
+        if (_isRolledBack)
         {
-            await action().ConfigureAwait(false);
-            return null;
-        }, cancellationToken, explicitEvents).ConfigureAwait(false);
+            throw new InvalidOperationException("Cannot enlist in a unit of work that has already failed and rolled back.");
+        }
+
+        // Only the outermost root execution initiates the physical transaction boundary
+        if (_nestingLevel == 0)
+        {
+            _isTransactionOwner = !_transactionAdapter.HasActiveTransaction;
+
+            try
+            {
+                if (_isTransactionOwner)
+                {
+                    await _transactionAdapter.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                    _logger.LogDebug("Initiated physical database transaction boundary as root owner.");
+                }
+                else
+                {
+                    _logger.LogDebug("Enlisted into existing ambient physical database transaction.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initiate transaction boundary. Initiating rollback cleanup.");
+                await SafeRollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
+        }
+        else
+        {
+            _logger.LogDebug("Joined nested transactional scope. Current depth: {Level}.", _nestingLevel + 1);
+        }
+
+        _nestingLevel++;
     }
 
     /// <inheritdoc />
-    public async Task<TResult> ExecuteAsync<TResult>(
-        Func<Task<TResult>> action,
+    public async Task CommitAsync(
         CancellationToken cancellationToken = default,
         params INotification[] explicitEvents)
     {
-        ArgumentNullException.ThrowIfNull(action);
+        ThrowIfDisposed();
 
-        TResult result;
+        if (_nestingLevel <= 0)
+        {
+            throw new InvalidOperationException("Cannot commit a unit of work that has not been initiated. Call BeginAsync first.");
+        }
+
+        if (_isRolledBack)
+        {
+            throw new InvalidOperationException("Cannot commit a unit of work that has been marked as rolled back.");
+        }
+
+        if (_isCommitted)
+        {
+            return;
+        }
+
+        // Accumulate explicit events provided at this level for consolidated execution at the root level
+        if (explicitEvents != null && explicitEvents.Length > 0)
+        {
+            _accumulatedExplicitEvents.AddRange(explicitEvents);
+        }
+
+        _nestingLevel--;
+
+        // If inner operations are still active, defer the physical persistence to the root scope
+        if (_nestingLevel > 0)
+        {
+            _logger.LogDebug("Nested scope completed. Deferring physical commit to root coordinator. Remaining depth: {Level}.", _nestingLevel);
+            return;
+        }
+
+        // =========================================================================
+        // --- Root Coordinator Execution Boundary ---
+        // =========================================================================
         var postCommitEvents = new List<IPostCommitNotification>();
-
-        // Check if this instance owns the outermost transaction boundary to support nested executions safely
-        bool isTransactionOwner = !_transactionAdapter.HasActiveTransaction;
 
         try
         {
-            // 1. Begin the underlying transaction boundary if no active transaction exists
-            if (isTransactionOwner)
+            // Drain loop: Process pre-commit domain events iteratively in batches.
+            // This ensures that any cascading/chained events registered by handlers during execution
+            // are fully consumed and executed within the active transaction before persisting changes.
+            while (true)
             {
-                await _transactionAdapter.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-                _logger.LogDebug("Initiated physical database transaction boundary.");
-            }
+                cancellationToken.ThrowIfCancellationRequested();
 
-            // 2. Execute the user's workload (mutates domain aggregates and registers state changes)
-            _logger.LogDebug("Executing transactional business workload.");
-            result = await action().ConfigureAwait(false);
+                var preCommitBatch = _accumulatedExplicitEvents
+                    .OfType<IPreCommitNotification>()
+                    .ToList();
 
-            // 3. Harvest events: Collect background entity events and merge with explicitly passed notifications
-            var backgroundEvents = _domainEventProvider?.GetDomainEvents() ?? Array.Empty<INotification>();
-            var explicitList = explicitEvents ?? Array.Empty<INotification>();
+                // Break the drain loop once no further pre-commit events remain
+                if (preCommitBatch.Count == 0)
+                {
+                    break;
+                }
 
-            var allEvents = backgroundEvents.Concat(explicitList).ToList();
+                // Immediately purge the batch from the accumulated collection to avoid duplicate processing
+                foreach (var preEvent in preCommitBatch)
+                {
+                    _accumulatedExplicitEvents.Remove(preEvent);
+                }
 
-            var preCommitEvents = allEvents.OfType<IPreCommitNotification>().ToList();
-            postCommitEvents.AddRange(allEvents.OfType<IPostCommitNotification>());
+                _logger.LogDebug("Publishing a batch of {Count} pre-commit domain event(s).", preCommitBatch.Count);
 
-            // 4. Dispatch pre-commit notifications sequentially within the active transaction
-            if (preCommitEvents.Count > 0)
-            {
-                _logger.LogDebug("Publishing {Count} pre-commit domain event(s).", preCommitEvents.Count);
-
-                foreach (var preEvent in preCommitEvents)
+                // Dispatch current batch sequentially inside the transaction boundary
+                foreach (var preEvent in preCommitBatch)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     await _mediator.Publish(preEvent, cancellationToken).ConfigureAwait(false);
                 }
             }
 
-            // 5. Commit the physical transaction boundary
-            if (isTransactionOwner)
+            // Extract all accumulated post-commit notifications once pre-commit operations stabilize
+            postCommitEvents.AddRange(_accumulatedExplicitEvents.OfType<IPostCommitNotification>());
+            _accumulatedExplicitEvents.Clear();
+
+            // 2. Persist all changes to the underlying database within the transaction boundary
+            await _transactionAdapter.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+            // 3. Commit the underlying physical database transaction if this instance owns the boundary
+            if (_isTransactionOwner)
             {
                 await _transactionAdapter.CommitAsync(cancellationToken).ConfigureAwait(false);
-                _logger.LogDebug("Committed physical database transaction boundary successfully.");
+                _logger.LogDebug("Physical database transaction committed successfully by root coordinator.");
             }
+
+            _isCommitted = true;
+            _accumulatedExplicitEvents.Clear();
         }
         catch (Exception ex)
         {
-            // 6. Rollback automatically on workload or pre-commit failures
-            _logger.LogError(ex, "An error occurred during transaction execution. Initiating automatic rollback.");
-
-            if (isTransactionOwner)
-            {
-                try
-                {
-                    await _transactionAdapter.RollbackAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception rollbackEx)
-                {
-                    _logger.LogCritical(rollbackEx, "Critical error: Failed to rollback physical transaction.");
-                }
-            }
-
-            // Rethrow original business exception to let upstream callers handle it
-            throw;
+            _logger.LogError(ex, "Transaction execution failed during root commit. Triggering rollback.");
+            await SafeRollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw; // Re-throw to propagate to upstream exception middleware
         }
 
-        // 7. Clear auto-harvested domain events only after a successful commit
-        _domainEventProvider?.ClearDomainEvents();
-
-        // 8. Dispatch post-commit notifications outside the transaction boundary
+        // 4. Dispatch post-commit notifications outside the transaction boundary
         if (postCommitEvents.Count > 0)
         {
             _logger.LogDebug(
@@ -155,12 +214,39 @@ public sealed class UnitOfWork : IUnitOfWork
 
             await PublishPostCommitEventsAsync(postCommitEvents, cancellationToken).ConfigureAwait(false);
         }
-
-        return result;
     }
 
     /// <summary>
-    /// Handles post-commit notifications sequentially or concurrently based on runtime configuration.
+    /// Executes a safe, non-lethal rollback of the active transaction across all enlisted scopes.
+    /// </summary>
+    /// <param name="cancellationToken">A cancellation token; defaults to None during cleanups.</param>
+    private async Task SafeRollbackAsync(CancellationToken cancellationToken)
+    {
+        if (_isRolledBack)
+        {
+            return;
+        }
+
+        _isRolledBack = true;
+        _accumulatedExplicitEvents.Clear();
+
+        // Regardless of ownership, a failure in any enlisted scope must revoke the physical transaction
+        if (_transactionAdapter.HasActiveTransaction)
+        {
+            try
+            {
+                await _transactionAdapter.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("Rolled back physical database transaction boundary.");
+            }
+            catch (Exception rollbackEx)
+            {
+                _logger.LogCritical(rollbackEx, "Critical error encountered while rolling back physical transaction.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dispatches post-commit notifications either sequentially or concurrently based on configured strategy.
     /// </summary>
     private async Task PublishPostCommitEventsAsync(
         IReadOnlyList<IPostCommitNotification> events,
@@ -170,7 +256,6 @@ public sealed class UnitOfWork : IUnitOfWork
 
         if (_options.PostCommitMode == PostCommitExecutionMode.Sequential)
         {
-            // Execute handlers sequentially one after another
             foreach (var postEvent in events)
             {
                 try
@@ -191,7 +276,6 @@ public sealed class UnitOfWork : IUnitOfWork
         }
         else
         {
-            // Execute handlers concurrently across thread pool tasks
             var tasks = events.Select(async postEvent =>
             {
                 try
@@ -215,10 +299,41 @@ public sealed class UnitOfWork : IUnitOfWork
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
 
-        // Apply error resilience policy
+        // Consolidate exceptions if configured to fail on post-commit side-effect errors
         if (exceptions.Count > 0 && _options.PostCommitErrorBehavior == PostCommitErrorBehavior.LogAndThrow)
         {
             throw new PostCommitExecutionException(exceptions);
+        }
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        // Safety fallback: If execution exited prematurely without an explicit commit, revert changes immediately
+        if (!_isCommitted && !_isRolledBack)
+        {
+            _logger.LogWarning("Unit of work scope disposed without reaching CommitAsync. Performing fallback rollback.");
+            await SafeRollbackAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+
+        if (_isTransactionOwner)
+        {
+            await _transactionAdapter.DisposeAsync().ConfigureAwait(false);
+        }
+
+        _isDisposed = true;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_isDisposed)
+        {
+            throw new ObjectDisposedException(nameof(UnitOfWork));
         }
     }
 }
