@@ -5,8 +5,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using MediatR;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using UnitR.Abstractions.Adapters;
 using UnitR.Abstractions.Contracts;
@@ -21,7 +21,7 @@ using UnitR.Core.Options;
 /// </summary>
 public sealed class UnitOfWork : IUnitOfWork
 {
-    private readonly IMediator _mediator;
+    private readonly IEventPublisherAdapter _eventPublisherAdapter;
     private readonly ILogger<UnitOfWork> _logger;
     private readonly UnitROptions _options;
     private readonly ITransactionAdapter _transactionAdapter;
@@ -34,7 +34,7 @@ public sealed class UnitOfWork : IUnitOfWork
     /// <summary>
     /// Accumulates domain events passed explicitly by callers across all nested operations.
     /// </summary>
-    private readonly List<INotification> _accumulatedExplicitEvents = new();
+    private readonly List<IUnitREvent> _accumulatedExplicitEvents = new();
 
     private bool _isCommitted;
     private bool _isRolledBack;
@@ -44,19 +44,19 @@ public sealed class UnitOfWork : IUnitOfWork
     /// <summary>
     /// Initializes a new instance of the <see cref="UnitOfWork"/> class.
     /// </summary>
-    /// <param name="mediator">The MediatR publishing engine used for notification dispatching.</param>
+    /// <param name="eventPublisherAdapter">The decoupled adapter used for event dispatching.</param>
     /// <param name="logger">The structured diagnostics logger.</param>
     /// <param name="options">Configuration options controlling post-commit behaviors.</param>
     /// <param name="transactionAdapter">The persistence adapter managing physical transaction boundaries.</param>
     /// <exception cref="ArgumentNullException">Thrown when any required dependency is null.</exception>
     public UnitOfWork(
-        IMediator mediator,
-        ILogger<UnitOfWork> logger,
+        IEventPublisherAdapter eventPublisherAdapter,
         IOptions<UnitROptions> options,
-        ITransactionAdapter transactionAdapter)
+        ITransactionAdapter transactionAdapter,
+        ILogger<UnitOfWork>? logger = null)
     {
-        _mediator = mediator ?? throw new ArgumentNullException(nameof(mediator));
-        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _eventPublisherAdapter = eventPublisherAdapter ?? throw new ArgumentNullException(nameof(eventPublisherAdapter));
+        _logger = logger ?? NullLogger<UnitOfWork>.Instance;
         _options = options?.Value ?? new UnitROptions();
         _transactionAdapter = transactionAdapter ?? throw new ArgumentNullException(nameof(transactionAdapter));
     }
@@ -106,7 +106,7 @@ public sealed class UnitOfWork : IUnitOfWork
     /// <inheritdoc />
     public async Task CommitAsync(
         CancellationToken cancellationToken = default,
-        params INotification[] explicitEvents)
+        params IUnitREvent[] explicitEvents)
     {
         ThrowIfDisposed();
 
@@ -143,7 +143,7 @@ public sealed class UnitOfWork : IUnitOfWork
         // =========================================================================
         // --- Root Coordinator Execution Boundary ---
         // =========================================================================
-        var postCommitEvents = new List<IPostCommitNotification>();
+        var postCommitEvents = new List<IPostCommitEvent>();
 
         try
         {
@@ -155,7 +155,7 @@ public sealed class UnitOfWork : IUnitOfWork
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var preCommitBatch = _accumulatedExplicitEvents
-                    .OfType<IPreCommitNotification>()
+                    .OfType<IPreCommitEvent>()
                     .ToList();
 
                 // Break the drain loop once no further pre-commit events remain
@@ -176,12 +176,12 @@ public sealed class UnitOfWork : IUnitOfWork
                 foreach (var preEvent in preCommitBatch)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    await _mediator.Publish(preEvent, cancellationToken).ConfigureAwait(false);
+                    await _eventPublisherAdapter.PublishAsync(preEvent, cancellationToken).ConfigureAwait(false);
                 }
             }
 
             // Extract all accumulated post-commit notifications once pre-commit operations stabilize
-            postCommitEvents.AddRange(_accumulatedExplicitEvents.OfType<IPostCommitNotification>());
+            postCommitEvents.AddRange(_accumulatedExplicitEvents.OfType<IPostCommitEvent>());
 
             // 2. Persist all changes to the underlying database within the transaction boundary
             await _transactionAdapter.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
@@ -248,7 +248,7 @@ public sealed class UnitOfWork : IUnitOfWork
     /// Dispatches post-commit notifications either sequentially or concurrently based on configured strategy.
     /// </summary>
     private async Task PublishPostCommitEventsAsync(
-        IReadOnlyList<IPostCommitNotification> events,
+        IReadOnlyList<IPostCommitEvent> events,
         CancellationToken cancellationToken)
     {
         var exceptions = new List<Exception>();
@@ -260,7 +260,7 @@ public sealed class UnitOfWork : IUnitOfWork
                 try
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    await _mediator.Publish(postEvent, cancellationToken).ConfigureAwait(false);
+                    await _eventPublisherAdapter.PublishAsync(postEvent, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -279,7 +279,7 @@ public sealed class UnitOfWork : IUnitOfWork
             {
                 try
                 {
-                    await _mediator.Publish(postEvent, cancellationToken).ConfigureAwait(false);
+                    await _eventPublisherAdapter.PublishAsync(postEvent, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
