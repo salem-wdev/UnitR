@@ -5,6 +5,31 @@
 /// </summary>
 public sealed class UnitROptions
 {
+    private int _maxPreCommitDrainIterations = 50;
+
+    /// <summary>
+    /// Gets or sets the maximum allowed iterations when draining cascading pre-commit domain events.
+    /// Protects against infinite loops caused by circular event publishing chains.
+    /// Default value is 50.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the assigned value is less than 1.</exception>
+    public int MaxPreCommitDrainIterations
+    {
+        get => _maxPreCommitDrainIterations;
+        set
+        {
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(value),
+                    value,
+                    "MaxPreCommitDrainIterations must be at least 1.");
+            }
+
+            _maxPreCommitDrainIterations = value;
+        }
+    }
+
     /// <summary>
     /// Gets or sets the execution mode for post-commit events.
     /// Defaults to <see cref="PostCommitExecutionMode.Sequential"/>.

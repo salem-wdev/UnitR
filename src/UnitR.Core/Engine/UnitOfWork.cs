@@ -46,7 +46,7 @@ public sealed class UnitOfWork : IUnitOfWork
     /// </summary>
     /// <param name="eventPublisherAdapter">The decoupled adapter used for event dispatching.</param>
     /// <param name="logger">The structured diagnostics logger.</param>
-    /// <param name="options">Configuration options controlling post-commit behaviors.</param>
+    /// <param name="options">Configuration options controlling orchestrator execution policies and event dispatching limits.</param>
     /// <param name="transactionAdapter">The persistence adapter managing physical transaction boundaries.</param>
     /// <exception cref="ArgumentNullException">Thrown when any required dependency is null.</exception>
     public UnitOfWork(
@@ -145,6 +145,9 @@ public sealed class UnitOfWork : IUnitOfWork
         // =========================================================================
         var postCommitEvents = new List<IPostCommitEvent>();
 
+        // Tracks the number of drain cycles executed to prevent infinite loops caused by circular event publishing chains.
+        int drainIterations = 0;
+
         try
         {
             // Drain loop: Process pre-commit domain events iteratively in batches.
@@ -153,6 +156,17 @@ public sealed class UnitOfWork : IUnitOfWork
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // Safeguard against infinite loops caused by circular event publishing chains
+                if (++drainIterations > _options.MaxPreCommitDrainIterations)
+                {
+                    _logger.LogError(
+                        "Pre-commit domain event draining exceeded the maximum allowed limit of {MaxIterations} iterations. Potential cyclic event chain detected.",
+                        _options.MaxPreCommitDrainIterations);
+
+                    throw new InvalidOperationException(
+                        $"Pre-commit domain event chain exceeded the maximum allowed limit of {_options.MaxPreCommitDrainIterations} iterations. Check for cyclic domain event publishing.");
+                }
 
                 var preCommitBatch = _accumulatedExplicitEvents
                     .OfType<IPreCommitEvent>()
