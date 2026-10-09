@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using UnitR.Abstractions.Adapters;
-using UnitR.Abstractions.Contracts;
+using UnitR.Abstractions.Events;
 using UnitR.Abstractions.Services;
 using UnitR.Core.ErrorHandling;
 using UnitR.Core.Options;
