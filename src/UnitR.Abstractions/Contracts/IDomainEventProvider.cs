@@ -1,7 +1,6 @@
 ﻿namespace UnitR.Abstractions.Contracts;
 
 using System.Collections.Generic;
-using MediatR;
 
 /// <summary>
 /// Defines a contract for types that collect and expose domain events,
@@ -13,7 +12,7 @@ public interface IDomainEventProvider
     /// Retrieves all uncommitted domain events currently recorded by this instance.
     /// </summary>
     /// <returns>A read-only collection of pending domain events.</returns>
-    IReadOnlyCollection<INotification> GetDomainEvents();
+    IReadOnlyCollection<IUnitREvent> GetDomainEvents();
 
     /// <summary>
     /// Clears all recorded domain events after successful processing to prevent duplicate execution.
