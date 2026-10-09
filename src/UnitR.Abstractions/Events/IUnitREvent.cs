@@ -1,4 +1,4 @@
-﻿namespace UnitR.Abstractions.Contracts;
+﻿namespace UnitR.Abstractions.Events;
 
 /// <summary>
 /// Defines a marker interface for all domain events and notifications managed by UnitR.
