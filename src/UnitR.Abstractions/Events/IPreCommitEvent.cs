@@ -1,4 +1,4 @@
-﻿namespace UnitR.Abstractions.Contracts;
+﻿namespace UnitR.Abstractions.Events;
 
 /// <summary>
 /// Marks a domain event that must be dispatched and executed inside the active transaction boundary

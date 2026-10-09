@@ -1,4 +1,4 @@
-﻿namespace UnitR.Abstractions.Contracts;
+﻿namespace UnitR.Abstractions.Events;
 
 using System.Collections.Generic;
 
