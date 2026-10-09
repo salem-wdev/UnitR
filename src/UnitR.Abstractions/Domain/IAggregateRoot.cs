@@ -1,7 +1,7 @@
 ﻿namespace UnitR.Abstractions.Domain;
 
 using System.Collections.Generic;
-using UnitR.Abstractions.Contracts;
+using UnitR.Abstractions.Events;
 
 /// <summary>
 /// Defines the contract for aggregate roots that generate and encapsulate domain events.

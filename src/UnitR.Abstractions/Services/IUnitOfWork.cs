@@ -3,7 +3,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-using UnitR.Abstractions.Contracts;
+using UnitR.Abstractions.Events;
 
 /// <summary>
 /// Defines the transactional unit-of-work orchestrator contract.
